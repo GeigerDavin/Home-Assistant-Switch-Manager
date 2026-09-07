@@ -28,7 +28,9 @@ We're looking for community input on what to build next! Vote by opening an [iss
 | Visual Blueprint Editor | Create blueprints in the GUI instead of writing YAML by hand ([PR #39](https://github.com/macpit/Home-Assistant-Switch-Manager/pull/39)) | In progress |
 | Action Test Buttons in switch config | Fire a single configured action from the switch view ([#50](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/50)) | Planned |
 | Switch Groups | Apply one configuration to several physical switches ([#45](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/45)) | Idea |
-| Blueprint Import via URL/YAML | Import community blueprints directly from a URL or paste YAML — no manual file copying | Idea |
+| Blueprint Import via URL/YAML | Import community blueprints directly from a URL or paste YAML — no manual file copying ([#77](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/77)) | Idea |
+| External blueprint repositories | Subscribe to community blueprint repos (GitHub repo or gist) HACS-style, so blueprints don't have to live in this repo ([#77](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/77)) | Idea |
+| "View on GitHub" link per blueprint | Link from the blueprint picker to the blueprint's YAML in this repo for issues and PRs ([#77](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/77)) | Idea |
 | Backup / Export | Export and import switch configurations as YAML for migration or backup | Idea |
 | Search & replace on clone | Replace device/entity IDs when duplicating a switch ([#4](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/4)) | Idea |
 | Repeat until release | Hold to dim: an action repeats its sequence until the button's release event arrives ([#27](https://github.com/macpit/Home-Assistant-Switch-Manager/issues/27)) | **Done (v5.1.0)** |
@@ -130,7 +132,13 @@ There will be an identifier or mqtt topic input box within the identifier dialog
 
 You can either enter the identifier manually or use the auto discovery button then press a button on the switch to autofill the value. There is a posibility that an identifier from some other device for the event to be discovered if that device sent an event before your button push. If this is the case and the button helper isn't getting the right identifier then you can manually find the information needed by clicking the Event|MQTT Tool link then listen for the event type needed or MQTT topic via `#`. 
 
-**If you have changed the default MQTT base topic for a service/integration and using a blueprint provided by Switch Manager then you will need to enter that topic manually as discovery will not work!**
+##### Zigbee2MQTT base topic / multiple instances
+
+Zigbee2MQTT blueprints are written for the default base topic `zigbee2mqtt`. The identifier dialog looks up the Zigbee2MQTT instances actually running on your broker (via their retained `<base_topic>/bridge/state` message) and offers them in a **Zigbee2MQTT instance** dropdown. By default discovery listens on **all** detected instances, so a renamed base topic (e.g. `zigbee2mqtt1_wz`) or several coordinators work out of the box; pick a single instance to narrow it down, or **Custom base topic...** to type one yourself. If no instance is detected (e.g. Zigbee2MQTT has never been online since the broker started) the dialog falls back to the blueprint default.
+
+<p align="center"><img src="images/v5-zigbee2mqtt-instances.png" width="60%" alt="Identifier dialog with the Zigbee2MQTT instance dropdown listing all detected coordinators" /></p>
+
+**For other MQTT services (e.g. Tasmota): if you have changed the default MQTT base topic and are using a blueprint provided by Switch Manager, enter the topic manually as discovery listens on the default topic only.**
 
 ##### Don't know event value
 
@@ -379,7 +387,7 @@ buttons:
 
 MQTT is handled differently to events and the incoming data is that of a payload... If a payload is not json formatted then it will be passed in as the key `payload` containing the string. The payload itself is what the conditions will check against. Included in the data is topic and topic_basename as this can be useful for condtions where a topic is listened via `#` or `+`.
 
-To help discover a switch when trying to discover from GUI then use a format for the topic in `mqtt_topic_format` that will scope down to the best possibility. For zigbee2mqtt this is generally `zigbee2mqtt/+/action`. The `+` is a wild card saying to match a single level (so anything between the forward slash `/`). For more information visit [here](https://www.hivemq.com/blog/mqtt-essentials-part-5-mqtt-topics-best-practices/). Sharing blueprints should be set to the default topic of the integration and not one that you have changed to. 
+To help discover a switch when trying to discover from GUI then use a format for the topic in `mqtt_topic_format` that will scope down to the best possibility. For zigbee2mqtt this is generally `zigbee2mqtt/+/action`. Blueprints with that format also receive the `action` key from the device's state topic `zigbee2mqtt/<device>` as `payload` (see [troubleshooting](#a-zigbee2mqtt-switch-is-never-discovered--does-nothing)), so they work whether or not Zigbee2MQTT's Home Assistant integration republishes to `/action`. The `+` is a wild card saying to match a single level (so anything between the forward slash `/`). For more information visit [here](https://www.hivemq.com/blog/mqtt-essentials-part-5-mqtt-topics-best-practices/). Sharing blueprints should be set to the default topic of the integration and not one that you have changed to. 
 
 If you want a condition on a payload that isn't json formatted then you would do as follows:
 ```yaml
@@ -494,15 +502,11 @@ You only see the mismatch error when a blueprint *dropped* buttons or actions, b
 
 #### A Zigbee2MQTT switch is never discovered / does nothing
 
-Most Zigbee2MQTT blueprints listen on `zigbee2mqtt/<device>/action`. That topic is not published by Zigbee2MQTT itself — it is republished by its **Home Assistant integration**, so it only exists when in Zigbee2MQTT:
+Most Zigbee2MQTT blueprints are written for `zigbee2mqtt/<device>/action`. That topic is not published by Zigbee2MQTT itself — it is republished by its **Home Assistant integration**, so it only exists when in Zigbee2MQTT the Home Assistant integration is **enabled** (`homeassistant.enabled: true`) and `advanced.output` is `json` (the default). The `legacy_action_sensor` option is unrelated.
 
-* the Home Assistant integration is **enabled** (`homeassistant.enabled: true`), and
-* `advanced.output` is `json` (the default — with `attribute` the integration refuses to start), and
-* the device is a supported one, not defined as a custom/unknown device.
+Since v5.3.0 this no longer matters for the switch itself: for `/action` blueprints Switch Manager also listens on the device's state topic `zigbee2mqtt/<device>` and uses the `action` key of its JSON payload (`{"action": "1_single", ...}`) as if it had arrived on `/action`. When Zigbee2MQTT publishes both, the second copy of a press is dropped, and retained state messages are ignored so a restart never replays the last press. The identifier of such a switch stays `zigbee2mqtt/<device>/action`, and auto discovery finds the device either way.
 
-You can check with any MQTT client (or the Zigbee2MQTT frontend) whether pressing the button publishes anything on `zigbee2mqtt/<device>/action`. If the device only publishes its state on `zigbee2mqtt/<device>`, none of the `/action` blueprints can ever match.
-
-The `legacy_action_sensor` option is unrelated to this topic even though toggling it has been reported to help — toggling it restarts Zigbee2MQTT, which is the more likely reason.
+If a switch still does nothing, check with any MQTT client (or the Zigbee2MQTT frontend) that pressing the button publishes on `zigbee2mqtt/<device>` (or `.../action`) at all, and that the topic matches the identifier of the switch, including the base topic (see [Zigbee2MQTT base topic](#zigbee2mqtt-base-topic--multiple-instances)).
 
 #### The panel looks unchanged after an update
 

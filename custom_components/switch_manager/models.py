@@ -1,8 +1,9 @@
 import time
 import re
+import json
 import copy
 import asyncio
-from .const import DOMAIN, LOGGER, LOOP_MAX_SECONDS, LOOP_INTERVAL_DEFAULT
+from .const import DOMAIN, LOGGER, LOOP_MAX_SECONDS, LOOP_INTERVAL_DEFAULT, ZIGBEE2MQTT_DEFAULT_BASE_TOPIC
 from .helpers import format_mqtt_message, get_val_from_str
 from homeassistant.core import HomeAssistant, Context, callback, Event
 from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
@@ -186,11 +187,106 @@ def get_device_name( hass: HomeAssistant, device_id ) -> str | None:
         return None
     return device.name_by_user or device.name
 
+async def async_discover_zigbee2mqtt_instances( hass: HomeAssistant, timeout: float = 1.5 ) -> list[str]:
+    """Return the base topics of all Zigbee2MQTT instances on the broker.
+
+    Every Zigbee2MQTT instance publishes a retained '<base_topic>/bridge/state'
+    message, so subscribing to it yields all instances right away without the
+    user having to press anything. Base topics with one or two levels are
+    supported (e.g. 'zigbee2mqtt1_wz' or 'home/zigbee2mqtt').
+    """
+    suffix = '/bridge/state'
+    found: set[str] = set()
+
+    @callback
+    def _handle( message: ReceiveMessage ):
+        topic = message.topic
+        if topic.endswith(suffix):
+            found.add( topic[:-len(suffix)] )
+
+    listeners = []
+    try:
+        listeners.append( await mqtt_subscribe(hass, f"+{suffix}", _handle) )
+        listeners.append( await mqtt_subscribe(hass, f"+/+{suffix}", _handle) )
+    except HomeAssistantError:
+        LOGGER.error("Unable to look up Zigbee2MQTT instances as MQTT is not loaded")
+        return []
+
+    try:
+        await asyncio.sleep(timeout)
+    finally:
+        for listener in listeners:
+            listener()
+    return sorted(found)
+
+def replace_mqtt_base_topic( topic_format: str, base_topic: str ) -> str:
+    """Swap the first level of a blueprint topic format for another base topic."""
+    _, _, rest = topic_format.partition('/')
+    return f"{base_topic.strip('/')}/{rest}" if rest else base_topic.strip('/')
+
+# Zigbee2MQTT only republishes a button press to '<device>/action' when its Home
+# Assistant integration is enabled (and 'advanced.output' is json). The press is
+# always part of the JSON on the state topic '<device>' though, so blueprints
+# written for the '/action' topic also listen there and treat the 'action' key
+# as if it had arrived on '/action'. When Zigbee2MQTT publishes both, the second
+# copy of the same press is dropped (#77).
+ZIGBEE2MQTT_ACTION_SUFFIX = '/action'
+ZIGBEE2MQTT_DUPLICATE_WINDOW = 1.0  # seconds between the state and the /action copy
+
+def uses_zigbee2mqtt_action_topic( blueprint ) -> bool:
+    return bool(
+        blueprint.is_zigbee2mqtt
+        and blueprint.mqtt_topic_format.endswith( ZIGBEE2MQTT_ACTION_SUFFIX )
+    )
+
+def action_from_zigbee2mqtt_state( message: ReceiveMessage ):
+    """Return the 'action' of a Zigbee2MQTT state message, or None."""
+    if message.retain:
+        # A retained state would replay the last press whenever we (re)subscribe.
+        return None
+    try:
+        data = json.loads( message.payload )
+    except (ValueError, TypeError):
+        return None
+    if not isinstance( data, dict ):
+        return None
+    action = data.get( 'action' )
+    if not isinstance( action, str ) or not action:
+        return None
+    return action
+
 async def create_event_listeners( hass: HomeAssistant, blueprint, mqtt_topic, _callback ):
+    action_topics = blueprint.is_mqtt and uses_zigbee2mqtt_action_topic( blueprint )
+    # (topic, payload) -> (source, monotonic time) of the last press, to drop the
+    # copy that arrives on the other topic within the duplicate window.
+    recent_presses = {}
+
+    def _dispatch( data, source ):
+        if action_topics:
+            now = time.monotonic()
+            for key in [ k for k, v in recent_presses.items() if now - v[1] >= ZIGBEE2MQTT_DUPLICATE_WINDOW ]:
+                del recent_presses[key]
+            key = ( data.get('topic'), data.get('payload') )
+            previous = recent_presses.get( key )
+            if previous and previous[0] != source:
+                del recent_presses[key]
+                return
+            recent_presses[key] = ( source, now )
+        _callback( data, Context() )
+
     @callback
     def _handleMQTT( message: ReceiveMessage ):
-        data = format_mqtt_message(message)
-        _callback( data.copy(), Context() )
+        if action_topics and not message.topic.endswith( ZIGBEE2MQTT_ACTION_SUFFIX ):
+            action = action_from_zigbee2mqtt_state( message )
+            if action is None:
+                return
+            _dispatch( {
+                'payload': action,
+                'topic': f"{message.topic}{ZIGBEE2MQTT_ACTION_SUFFIX}",
+                'topic_basename': 'action'
+            }, 'state' )
+            return
+        _dispatch( format_mqtt_message(message).copy(), 'action' )
     
     @callback
     def _handleEvent( event ):
@@ -210,6 +306,12 @@ async def create_event_listeners( hass: HomeAssistant, blueprint, mqtt_topic, _c
     elif blueprint.is_mqtt:
         try:
             listeners.append( await mqtt_subscribe(hass, mqtt_topic, _handleMQTT) )
+            if action_topics and mqtt_topic.endswith( ZIGBEE2MQTT_ACTION_SUFFIX ):
+                # A switch listens on its '<device>/action' identifier; discovery
+                # subscribes to '<base>/#' and already receives the state topic.
+                listeners.append( await mqtt_subscribe(
+                    hass, mqtt_topic[:-len(ZIGBEE2MQTT_ACTION_SUFFIX)], _handleMQTT
+                ) )
             if blueprint.mqtt_sub_topics:
                 listeners.append( await mqtt_subscribe(hass, f"{mqtt_topic}/#", _handleMQTT) )
         except HomeAssistantError:
@@ -232,6 +334,12 @@ class Blueprint:
         self.is_event_entity = self.event_type == EVENT_TYPE_EVENT_ENTITY
         self.mqtt_topic_format = config.get('mqtt_topic_format', None)
         self.mqtt_sub_topics = config.get('mqtt_sub_topics', False)
+        # Blueprints for Zigbee2MQTT use the default base topic in their topic
+        # format; discovery may swap it for the base topics actually in use.
+        self.is_zigbee2mqtt = bool(
+            self.is_mqtt and self.mqtt_topic_format
+            and self.mqtt_topic_format.split('/', 1)[0] == ZIGBEE2MQTT_DEFAULT_BASE_TOPIC
+        )
         self.identifier_key = config.get('identifier_key')
         self.info = config.get('info')
         self.conditions = convert_conditions( hass, config.get('conditions', []) )
@@ -245,7 +353,7 @@ class Blueprint:
             return False
         return check_conditions( self._hass, self.conditions, data )
 
-    async def start_discovery( self, _callback ):
+    async def start_discovery( self, _callback, base_topics: list[str] | None = None ):
         listeners = []
         @callback
         def remove_listener():
@@ -255,41 +363,59 @@ class Blueprint:
         if self.is_mqtt and not self.mqtt_topic_format:
             return None
 
+        # A Zigbee2MQTT blueprint is written for the default base topic. When the
+        # caller hands over the base topics actually in use (one per instance),
+        # discovery listens on every one of them instead.
+        topic_formats = [self.mqtt_topic_format]
+        if self.is_zigbee2mqtt and base_topics:
+            topic_formats = [
+                replace_mqtt_base_topic(self.mqtt_topic_format, base)
+                for base in base_topics if base and base.strip('/')
+            ] or topic_formats
+
         # MQTT '+' is a single-level wildcard, so a device whose name contains
         # '/' (e.g. "Location on/off" -> zigbee2mqtt/Location on/off/action) adds
         # an extra topic level that 'zigbee2mqtt/+/action' can never match. For
         # discovery we therefore subscribe to a multi-level wildcard and match the
         # original pattern in Python, where '+' is allowed to span '/' too.
-        subscribe_topic = self.mqtt_topic_format
-        topic_matcher = None
-        if self.is_mqtt and '+' in self.mqtt_topic_format:
-            subscribe_topic = self.mqtt_topic_format.split('+', 1)[0] + '#'
-            pattern = re.escape(self.mqtt_topic_format).replace(r'\+', r'.+')
-            topic_matcher = re.compile('^' + pattern + '$')
+        subscriptions = []
+        for topic_format in topic_formats:
+            subscribe_topic = topic_format
+            topic_matcher = None
+            if self.is_mqtt and '+' in topic_format:
+                subscribe_topic = topic_format.split('+', 1)[0] + '#'
+                pattern = re.escape(topic_format).replace(r'\+', r'.+')
+                topic_matcher = re.compile('^' + pattern + '$')
+            subscriptions.append( (subscribe_topic, topic_matcher) )
 
-        @callback
-        def _processIncoming( data, context ):
-            if topic_matcher and not topic_matcher.match( data.get('topic', '') ):
-                return
-            if not self.check_conditions(data):
-                return
-
-            for button in self.buttons:
-                if not button.check_conditions( data ):
-                    continue
-                for action in button.actions:
-                    if not action.check_conditions( data ):
-                        continue
-                    identifier = data.get('topic') if self.is_mqtt else data.get(self.identifier_key)
-                    discovered = { "identifier": identifier }
-                    if self.is_event_entity:
-                        # A device id says nothing to a human, so hand the panel the
-                        # device name as well for the discovery list.
-                        discovered['name'] = get_device_name( self._hass, data.get('device_id') )
-                    _callback( discovered )
+        def _make_processor( topic_matcher ):
+            @callback
+            def _processIncoming( data, context ):
+                if topic_matcher and not topic_matcher.match( data.get('topic', '') ):
+                    return
+                if not self.check_conditions(data):
                     return
 
-        listeners = await create_event_listeners( self._hass, self, subscribe_topic, _processIncoming )
+                for button in self.buttons:
+                    if not button.check_conditions( data ):
+                        continue
+                    for action in button.actions:
+                        if not action.check_conditions( data ):
+                            continue
+                        identifier = data.get('topic') if self.is_mqtt else data.get(self.identifier_key)
+                        discovered = { "identifier": identifier }
+                        if self.is_event_entity:
+                            # A device id says nothing to a human, so hand the panel the
+                            # device name as well for the discovery list.
+                            discovered['name'] = get_device_name( self._hass, data.get('device_id') )
+                        _callback( discovered )
+                        return
+            return _processIncoming
+
+        for subscribe_topic, topic_matcher in subscriptions:
+            listeners.extend( await create_event_listeners(
+                self._hass, self, subscribe_topic, _make_processor(topic_matcher)
+            ) )
         return remove_listener
 
     def from_dict(cls, data):
